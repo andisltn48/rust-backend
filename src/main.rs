@@ -1,4 +1,5 @@
 use core::fmt;
+use std::fmt::format;
 
 use actix_web::{delete, get, middleware::Logger, post, put, web, App, HttpResponse, HttpServer, Responder, ResponseError};
 use env_logger;
@@ -117,6 +118,12 @@ impl fmt::Display for ApiError {
     }
 }
 
+impl From<sqlx::Error> for ApiError {
+    fn from(err: sqlx::Error) -> Self {
+        ApiError::DatabaseError(format!("Database Error: {}", err))
+    }
+}
+
 //Routes
 async fn index_page() -> &'static str {
     "Hello world!"
@@ -126,6 +133,25 @@ async fn index_page() -> &'static str {
 async fn create_blog_post(data: web::Data<PgPool>, new_post: web::Json<NewBlogPost>) -> Result<impl Responder, ApiError> {
     let post = save_blog_post(&data, &new_post).await.expect("failed to save blog post");
     Ok(HttpResponse::Ok().json(post))
+}
+
+#[get("/blog")]
+async fn get_all_blog_posts(data: web::Data<PgPool>) -> Result<impl Responder, ApiError> {
+    let posts = find_all_post(&data).await.map_err(ApiError::from)?;
+    Ok(HttpResponse::Ok().json(posts))
+}
+
+#[get("/blog/{id}")]
+async fn get_blog_post_by_id(data: web::Data<PgPool>, id: web::Path<i32>) -> Result<impl Responder, ApiError> {
+    match find_post_by_id(&data, id.into_inner()).await {
+        Ok(post) => Ok(HttpResponse::Ok().json(post)),
+        Err(err) => {
+            if let sqlx::Error::RowNotFound = err {
+                return Err(ApiError::NotFound("blog post not found".to_string()));
+            }
+            Err(ApiError::from(err))
+        }
+    }
 }
 
 #[actix_web::main]
@@ -146,6 +172,8 @@ async fn main() -> Result<(), std::io::Error> {
             .wrap(Logger::default())
             .route("/", web::get().to(index_page))
             .service(create_blog_post)
+            .service(get_all_blog_posts)
+            .service(get_blog_post_by_id)
     })
     .bind(("127.0.0.1", 8080))?
     .run()
