@@ -1,7 +1,6 @@
 use core::fmt;
-use std::{f32::consts::E, fmt::format};
 
-use actix_web::{delete, get, middleware::Logger, post, put, web, App, HttpResponse, HttpServer, Responder, ResponseError};
+use actix_web::{delete, get, http::StatusCode, middleware::Logger, post, put, web, App, HttpResponse, HttpServer, Responder, ResponseError};
 use env_logger;
 use serde::{Deserialize, Serialize};
 use sqlx::{postgres::PgPoolOptions, prelude::FromRow, PgPool};
@@ -80,48 +79,73 @@ pub async fn update_post_by_id(pool: &PgPool, id: i32, blog_post: &NewBlogPost) 
 
 //Error handling
 #[derive(Debug, Serialize, Deserialize)]
-enum ApiError {
-    InternalError(String),
-    ValidationError(String),
-    NotFound(String),
-    DatabaseError(String)
+pub struct ApiError {
+    pub error_type: String,
+    pub message: String,
 }
 
-impl ResponseError for ApiError {
-    fn error_response(&self) -> actix_web::HttpResponse {
-        match self {
-            ApiError::InternalError(msg) => actix_web::HttpResponse::InternalServerError().json(msg),
-            ApiError::ValidationError(msg) => actix_web::HttpResponse::BadRequest().json(msg),
-            ApiError::NotFound(msg) => actix_web::HttpResponse::NotFound().json(msg),
-            ApiError::DatabaseError(msg) => actix_web::HttpResponse::InternalServerError().json(msg)
+impl ApiError {
+    pub fn internal_error(message: String) -> Self {
+        ApiError {
+            error_type: "InternalError".to_string(),
+            message,
         }
     }
 
-    fn status_code(&self) -> actix_web::http::StatusCode {
-        match self {
-            ApiError::InternalError(_) => actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
-            ApiError::ValidationError(_) => actix_web::http::StatusCode::BAD_REQUEST,
-            ApiError::NotFound(_) => actix_web::http::StatusCode::NOT_FOUND,
-            ApiError::DatabaseError(_) => actix_web::http::StatusCode::INTERNAL_SERVER_ERROR
+    pub fn validation_error(message: String) -> Self {
+        ApiError {
+            error_type: "ValidationError".to_string(),
+            message,
         }
+    }
+
+    pub fn not_found(message: String) -> Self {
+        ApiError {
+            error_type: "NotFound".to_string(),
+            message,
+        }
+    }
+
+    pub fn database_error(message: String) -> Self {
+        ApiError {
+            error_type: "DatabaseError".to_string(),
+            message,
+        }
+    }
+}
+
+// Implementing the ResponseError trait for ApiError
+impl ResponseError for ApiError {
+    fn status_code(&self) -> StatusCode {
+        match self.error_type.as_str() {
+            "InternalError" => StatusCode::INTERNAL_SERVER_ERROR,
+            "ValidationError" => StatusCode::BAD_REQUEST,
+            "NotFound" => StatusCode::NOT_FOUND,
+            "DatabaseError" => StatusCode::SERVICE_UNAVAILABLE,
+            _ => StatusCode::INTERNAL_SERVER_ERROR, // Default to InternalServerError
+        }
+    }
+
+    fn error_response(&self) -> HttpResponse {
+        HttpResponse::build(self.status_code())
+            .json(ErrorApiResponse { error: self.message.clone() }) // Serializing ApiError to JSON
     }
 }
 
 impl fmt::Display for ApiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ApiError::InternalError(msg) => write!(f, "Internal Server Error: {}", msg),
-            ApiError::ValidationError(msg) => write!(f, "Validation Error: {}", msg),
-            ApiError::NotFound(msg) => write!(f, "Not Found: {}", msg),
-            ApiError::DatabaseError(msg) => write!(f, "Database Error: {}", msg)
-        }
+        write!(f, "{}: {}", self.error_type, self.message)
     }
 }
 
-impl From<sqlx::Error> for ApiError {
-    fn from(err: sqlx::Error) -> Self {
-        ApiError::DatabaseError(format!("Database Error: {}", err))
-    }
+//API Response
+#[derive(Deserialize, Serialize)]
+pub struct ApiResponse<T> {
+    data: T
+}
+#[derive(Deserialize, Serialize)]
+pub struct ErrorApiResponse<T> {
+    error: T
 }
 
 //Routes
@@ -132,24 +156,45 @@ async fn index_page() -> &'static str {
 #[post("/blog")]
 async fn create_blog_post(data: web::Data<PgPool>, new_post: web::Json<NewBlogPost>) -> Result<impl Responder, ApiError> {
     let post = save_blog_post(&data, &new_post).await.expect("failed to save blog post");
-    Ok(HttpResponse::Ok().json(post))
+    let response = ApiResponse {
+        data: post
+    };
+    Ok(HttpResponse::Ok().json(response))
 }
 
 #[get("/blog")]
 async fn get_all_blog_posts(data: web::Data<PgPool>) -> Result<impl Responder, ApiError> {
-    let posts = find_all_post(&data).await.map_err(ApiError::from)?;
-    Ok(HttpResponse::Ok().json(posts))
+    match find_all_post(&data).await {
+        Ok(posts) => {
+            let response = ApiResponse {
+                data: posts
+            };
+            Ok(HttpResponse::Ok().json(response))
+        },
+        Err(err) => return Err(ApiError {
+            error_type: "InternalError".to_string(),
+            message: err.to_string(),
+        })
+    }
 }
 
 #[get("/blog/{id}")]
 async fn get_blog_post_by_id(data: web::Data<PgPool>, id: web::Path<i32>) -> Result<impl Responder, ApiError> {
     match find_post_by_id(&data, id.into_inner()).await {
-        Ok(post) => Ok(HttpResponse::Ok().json(post)),
+        Ok(post) => {
+            let response = ApiResponse {
+                data: post
+            };
+            Ok(HttpResponse::Ok().json(response))
+        },
         Err(err) => {
             if let sqlx::Error::RowNotFound = err {
-                return Err(ApiError::NotFound("blog post not found".to_string()));
+                return Err(ApiError { error_type: "NotFound".to_string(), message: "blog post not found".to_string() });
             }
-            Err(ApiError::from(err))
+            Err(ApiError {
+                error_type: "InternalError".to_string(),
+                message: err.to_string(),
+            })
         }
     }
 }
@@ -161,12 +206,20 @@ async fn update_post(
     new_post: web::Json<NewBlogPost>
 ) -> Result<impl Responder, ApiError> {
     match update_post_by_id(&data, id.into_inner(), &new_post).await {
-        Ok(post) => Ok(HttpResponse::Ok().json(post)),
+        Ok(post) => {
+            let response = ApiResponse {
+                data: post
+            };
+            Ok(HttpResponse::Ok().json(response))
+        },
         Err(err) => {
             if let sqlx::Error::RowNotFound = err {
-                return Err(ApiError::NotFound("blog post not found".to_string()));
+                return Err(ApiError { error_type: "NotFound".to_string(), message: "blog post not found".to_string() });
             }
-            Err(ApiError::from(err))
+            Err(ApiError{
+                error_type: "InternalError".to_string(),
+                message: err.to_string(),
+            })
         }
     }
 }
@@ -177,9 +230,12 @@ async fn delete_post(data: web::Data<PgPool>, id: web::Path<i32>) -> Result<impl
         Ok(_) => Ok(HttpResponse::NoContent().finish()),
         Err(err) => {
             if let sqlx::Error::RowNotFound = err {
-                return Err(ApiError::NotFound("blog post not found".to_string()));
+                return Err(ApiError { error_type: "NotFound".to_string(), message: "blog post not found".to_string() });
             }
-            Err(ApiError::from(err))
+            Err(ApiError{
+                error_type: "InternalError".to_string(),
+                message: err.to_string(),
+            })
         }
         
     }
