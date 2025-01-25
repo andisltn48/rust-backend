@@ -1,5 +1,5 @@
 use core::fmt;
-use std::fmt::format;
+use std::{f32::consts::E, fmt::format};
 
 use actix_web::{delete, get, middleware::Logger, post, put, web, App, HttpResponse, HttpServer, Responder, ResponseError};
 use env_logger;
@@ -154,6 +154,37 @@ async fn get_blog_post_by_id(data: web::Data<PgPool>, id: web::Path<i32>) -> Res
     }
 }
 
+#[put("/blog/{id}")]
+async fn update_post(
+    data: web::Data<PgPool>,
+    id: web::Path<i32>,
+    new_post: web::Json<NewBlogPost>
+) -> Result<impl Responder, ApiError> {
+    match update_post_by_id(&data, id.into_inner(), &new_post).await {
+        Ok(post) => Ok(HttpResponse::Ok().json(post)),
+        Err(err) => {
+            if let sqlx::Error::RowNotFound = err {
+                return Err(ApiError::NotFound("blog post not found".to_string()));
+            }
+            Err(ApiError::from(err))
+        }
+    }
+}
+
+#[delete("/blog/{id}")]
+async fn delete_post(data: web::Data<PgPool>, id: web::Path<i32>) -> Result<impl Responder, ApiError> {
+    match delete_post_by_id(&data, id.into_inner()).await {
+        Ok(_) => Ok(HttpResponse::NoContent().finish()),
+        Err(err) => {
+            if let sqlx::Error::RowNotFound = err {
+                return Err(ApiError::NotFound("blog post not found".to_string()));
+            }
+            Err(ApiError::from(err))
+        }
+        
+    }
+}
+
 #[actix_web::main]
 async fn main() -> Result<(), std::io::Error> {
     //Server configuration
@@ -174,6 +205,8 @@ async fn main() -> Result<(), std::io::Error> {
             .service(create_blog_post)
             .service(get_all_blog_posts)
             .service(get_blog_post_by_id)
+            .service(update_post)
+            .service(delete_post)
     })
     .bind(("127.0.0.1", 8080))?
     .run()
